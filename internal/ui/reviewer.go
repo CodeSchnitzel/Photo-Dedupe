@@ -28,8 +28,8 @@ import (
 // tappableImage wraps a canvas.Image so it can receive tap events.
 type tappableImage struct {
 	widget.BaseWidget
-	img     *canvas.Image
-	onTap   func()
+	img   *canvas.Image
+	onTap func()
 }
 
 func newTappableImage(img *canvas.Image, onTap func()) *tappableImage {
@@ -38,30 +38,16 @@ func newTappableImage(img *canvas.Image, onTap func()) *tappableImage {
 	return t
 }
 
-func (t *tappableImage) Tapped(_ *fyne.PointEvent) {
-	if t.onTap != nil {
-		t.onTap()
-	}
-}
+func (t *tappableImage) Tapped(_ *fyne.PointEvent)          { if t.onTap != nil { t.onTap() } }
+func (t *tappableImage) TappedSecondary(_ *fyne.PointEvent)  {}
+func (t *tappableImage) CreateRenderer() fyne.WidgetRenderer { return widget.NewSimpleRenderer(t.img) }
+func (t *tappableImage) MinSize() fyne.Size                  { return t.img.MinSize() }
 
-func (t *tappableImage) TappedSecondary(_ *fyne.PointEvent) {}
-
-func (t *tappableImage) CreateRenderer() fyne.WidgetRenderer {
-	return widget.NewSimpleRenderer(t.img)
-}
-
-func (t *tappableImage) MinSize() fyne.Size {
-	return t.img.MinSize()
-}
-
-// RunReviewUI launches the Fyne desktop app for reviewing near-matches.
+// RunReviewUI launches the Fyne desktop app for reviewing matches.
 // It reads results.json from the holding folder (produced by the check command).
 //
-// Interaction model:
-//   - Click LEFT image (holding file) to keep it. A dialog asks whether to
-//     replace the collection file, delete the collection file, or cancel.
-//   - Click RIGHT image (collection file) to keep it. The holding file is deleted.
-//   - "Keep Both" leaves both files untouched and removes the entry from review.
+// Phase 1 — Exact duplicates: scrollable checklist with batch delete.
+// Phase 2 — Near matches: side-by-side comparison with click-to-keep.
 func RunReviewUI(holdingPath string) error {
 	resultsPath := filepath.Join(holdingPath, "results.json")
 	allEntries, err := loadReviewList(resultsPath)
@@ -69,39 +55,180 @@ func RunReviewUI(holdingPath string) error {
 		return fmt.Errorf("load results: %w", err)
 	}
 
-	// Filter to near matches only — exact duplicates don't need visual review.
-	var entries []checker.CheckResult
+	var duplicates, nearMatches []checker.CheckResult
 	for _, e := range allEntries {
-		if e.MatchType == checker.MatchNear {
-			entries = append(entries, e)
+		switch e.MatchType {
+		case checker.MatchExact:
+			duplicates = append(duplicates, e)
+		case checker.MatchNear:
+			nearMatches = append(nearMatches, e)
 		}
 	}
 
-	if len(entries) == 0 {
-		fmt.Println("No near-matches to review.")
+	if len(duplicates) == 0 && len(nearMatches) == 0 {
+		fmt.Println("No matches to review.")
 		return nil
 	}
 
 	a := app.New()
-	w := a.NewWindow("Photo Dedup — Review Near Matches")
+	w := a.NewWindow("Photo Dedup — Review")
 	w.Resize(fyne.NewSize(1200, 700))
+
+	// Phase routing: show duplicates first if any, then near matches.
+	if len(duplicates) > 0 {
+		showDuplicatesPhase(w, resultsPath, duplicates, nearMatches)
+	} else {
+		showNearMatchPhase(w, resultsPath, nearMatches)
+	}
+
+	w.ShowAndRun()
+	return nil
+}
+
+// showDuplicatesPhase displays a scrollable checklist of exact duplicates.
+// All items are checked by default. The user can uncheck any they want to keep,
+// then click "Delete Selected" to remove the checked holding files.
+func showDuplicatesPhase(w fyne.Window, resultsPath string, duplicates []checker.CheckResult, nearMatches []checker.CheckResult) {
+	title := widget.NewLabel(fmt.Sprintf("Exact Duplicates — %d files", len(duplicates)))
+	title.TextStyle = fyne.TextStyle{Bold: true}
+
+	subtitle := widget.NewLabel("These holding files have identical hashes to files already in your collection.\nAll are selected for deletion. Uncheck any you want to keep.")
+	subtitle.Wrapping = fyne.TextWrapWord
+
+	// Create a check for each duplicate, defaulting to checked.
+	checks := make([]*widget.Check, len(duplicates))
+	listItems := make([]fyne.CanvasObject, len(duplicates))
+
+	for i, d := range duplicates {
+		label := fmt.Sprintf("%s\n  matches: %s",
+			filepath.Base(d.HoldingFile),
+			filepath.Base(d.MatchPath))
+		checks[i] = widget.NewCheck(label, nil)
+		checks[i].SetChecked(true)
+		listItems[i] = checks[i]
+	}
+
+	scrollable := container.NewVScroll(container.NewVBox(listItems...))
+	scrollable.SetMinSize(fyne.NewSize(800, 400))
+
+	// Select All / Deselect All.
+	selectAllBtn := widget.NewButton("Select All", func() {
+		for _, c := range checks {
+			c.SetChecked(true)
+		}
+	})
+	deselectAllBtn := widget.NewButton("Deselect All", func() {
+		for _, c := range checks {
+			c.SetChecked(false)
+		}
+	})
+
+	var deleteBtn *widget.Button
+	deleteBtn = widget.NewButton("Delete Selected", func() {
+		// Count selected.
+		var selected int
+		for _, c := range checks {
+			if c.Checked {
+				selected++
+			}
+		}
+		if selected == 0 {
+			dialog.ShowInformation("Nothing Selected", "No files are selected for deletion.", w)
+			return
+		}
+
+		dialog.ShowConfirm("Confirm Delete",
+			fmt.Sprintf("Permanently delete %d holding file(s)?", selected),
+			func(confirmed bool) {
+				if !confirmed {
+					return
+				}
+				var deleted, errors int
+				var kept []checker.CheckResult
+				for i, d := range duplicates {
+					if checks[i].Checked {
+						if err := os.Remove(d.HoldingFile); err != nil {
+							log.Printf("ERROR deleting %s: %v", d.HoldingFile, err)
+							errors++
+							kept = append(kept, d) // keep in results if delete failed
+						} else {
+							log.Printf("DELETE: %s", d.HoldingFile)
+							deleted++
+						}
+					} else {
+						kept = append(kept, d) // unchecked = user wants to keep
+					}
+				}
+
+				// Update results.json — remove successfully deleted entries.
+				remaining := append(kept, nearMatches...)
+				saveReviewList(resultsPath, remaining)
+
+				msg := fmt.Sprintf("Deleted %d file(s).", deleted)
+				if errors > 0 {
+					msg += fmt.Sprintf("\n%d file(s) could not be deleted (see log).", errors)
+				}
+
+				dialog.ShowInformation("Done", msg, w)
+
+				// Move to near-match phase.
+				if len(nearMatches) > 0 {
+					showNearMatchPhase(w, resultsPath, nearMatches)
+				} else {
+					w.SetContent(container.NewCenter(widget.NewLabel("All items reviewed!")))
+				}
+			}, w)
+	})
+
+	skipBtn := widget.NewButton("Skip to Near Matches", func() {
+		if len(nearMatches) > 0 {
+			showNearMatchPhase(w, resultsPath, nearMatches)
+		} else {
+			w.SetContent(container.NewCenter(widget.NewLabel("No near-matches to review.")))
+		}
+	})
+
+	topBar := container.NewVBox(title, subtitle)
+	selectionBar := container.NewHBox(selectAllBtn, deselectAllBtn)
+	bottomBar := container.NewHBox(
+		deleteBtn,
+		layout.NewSpacer(),
+		skipBtn,
+	)
+
+	content := container.NewBorder(
+		container.NewVBox(topBar, selectionBar),
+		bottomBar,
+		nil, nil,
+		scrollable,
+	)
+
+	w.SetContent(content)
+}
+
+// showNearMatchPhase displays the side-by-side near-match review UI.
+func showNearMatchPhase(w fyne.Window, resultsPath string, nearMatches []checker.CheckResult) {
+	w.SetTitle("Photo Dedup — Review Near Matches")
+
+	if len(nearMatches) == 0 {
+		w.SetContent(container.NewCenter(widget.NewLabel("No near-matches to review.")))
+		return
+	}
 
 	// State.
 	currentIdx := 0
-	remaining := make([]checker.CheckResult, len(entries))
-	copy(remaining, entries)
+	remaining := make([]checker.CheckResult, len(nearMatches))
+	copy(remaining, nearMatches)
 
 	// UI elements.
 	statusLabel := widget.NewLabel("")
 	distanceLabel := widget.NewLabel("")
 
-	// Left side (holding file) labels: path then filename.
 	holdingPathLabel := widget.NewLabel("")
 	holdingPathLabel.TextStyle = fyne.TextStyle{Italic: true}
 	holdingNameLabel := widget.NewLabel("")
 	holdingNameLabel.TextStyle = fyne.TextStyle{Bold: true}
 
-	// Right side (collection match) labels: path then filename.
 	matchPathLabel := widget.NewLabel("")
 	matchPathLabel.TextStyle = fyne.TextStyle{Italic: true}
 	matchNameLabel := widget.NewLabel("")
@@ -115,7 +242,6 @@ func RunReviewUI(holdingPath string) error {
 	matchImg.FillMode = canvas.ImageFillContain
 	matchImg.SetMinSize(fyne.NewSize(500, 500))
 
-	// Helper to remove current entry and advance.
 	removeCurrentAndAdvance := func() {
 		remaining = append(remaining[:currentIdx], remaining[currentIdx+1:]...)
 		if currentIdx >= len(remaining) && currentIdx > 0 {
@@ -124,14 +250,9 @@ func RunReviewUI(holdingPath string) error {
 		saveReviewList(resultsPath, remaining)
 	}
 
-	// Forward-declare updateDisplay so the tappable images can reference it.
 	var updateDisplay func()
 
 	// Click LEFT image → keep the holding file.
-	// Ask: replace collection file with holding file?
-	//   Yes → overwrite collection file with holding file
-	//   No  → delete collection file, leave holding file
-	//   Cancel → do nothing
 	onTapHolding := func() {
 		if currentIdx >= len(remaining) {
 			return
@@ -148,7 +269,6 @@ func RunReviewUI(holdingPath string) error {
 				filepath.Base(collectionFile), filepath.Base(holdingFile)),
 			func(replace bool) {
 				if replace {
-					// Copy holding file over collection file.
 					data, err := os.ReadFile(holdingFile)
 					if err != nil {
 						dialog.ShowError(fmt.Errorf("read holding file: %w", err), w)
@@ -160,7 +280,6 @@ func RunReviewUI(holdingPath string) error {
 					}
 					log.Printf("REPLACE: %s → %s", holdingFile, collectionFile)
 				} else {
-					// Delete collection file, leave holding file.
 					if err := os.Remove(collectionFile); err != nil {
 						dialog.ShowError(fmt.Errorf("delete collection file: %w", err), w)
 						return
@@ -175,7 +294,7 @@ func RunReviewUI(holdingPath string) error {
 		dlg.Show()
 	}
 
-	// Click RIGHT image → keep the collection file, delete the holding file.
+	// Click RIGHT image → keep the collection file, delete holding file.
 	onTapMatch := func() {
 		if currentIdx >= len(remaining) {
 			return
@@ -201,7 +320,6 @@ func RunReviewUI(holdingPath string) error {
 	tappableHolding := newTappableImage(holdingImg, onTapHolding)
 	tappableMatch := newTappableImage(matchImg, onTapMatch)
 
-	// Keep Both — not duplicates, remove from review list without deleting anything.
 	keepBothBtn := widget.NewButton("Keep Both", func() {
 		if currentIdx >= len(remaining) {
 			return
@@ -231,11 +349,9 @@ func RunReviewUI(holdingPath string) error {
 		statusLabel.SetText(fmt.Sprintf("Item %d of %d", currentIdx+1, len(remaining)))
 		distanceLabel.SetText(fmt.Sprintf("Hamming distance: %d", entry.Distance))
 
-		// Holding file: path + name.
 		holdingPathLabel.SetText(filepath.Dir(entry.HoldingFile))
 		holdingNameLabel.SetText(fmt.Sprintf("Holding: %s", filepath.Base(entry.HoldingFile)))
 
-		// Load holding image.
 		if img, err := loadImage(entry.HoldingFile); err == nil {
 			holdingImg.Image = img
 		} else {
@@ -245,7 +361,6 @@ func RunReviewUI(holdingPath string) error {
 		holdingImg.Refresh()
 		tappableHolding.Refresh()
 
-		// Collection match: path + name.
 		if entry.MatchPath != "" {
 			matchPathLabel.SetText(filepath.Dir(entry.MatchPath))
 			matchNameLabel.SetText(fmt.Sprintf("Collection: %s", filepath.Base(entry.MatchPath)))
@@ -264,23 +379,18 @@ func RunReviewUI(holdingPath string) error {
 		tappableMatch.Refresh()
 	}
 
-	// Navigation: Skip.
 	skipBtn := widget.NewButton("Skip", func() {
 		if currentIdx < len(remaining)-1 {
 			currentIdx++
 			updateDisplay()
 		}
 	})
-
-	// Navigation: Previous.
 	prevBtn := widget.NewButton("< Prev", func() {
 		if currentIdx > 0 {
 			currentIdx--
 			updateDisplay()
 		}
 	})
-
-	// Navigation: Next.
 	nextBtn := widget.NewButton("Next >", func() {
 		if currentIdx < len(remaining)-1 {
 			currentIdx++
@@ -292,20 +402,13 @@ func RunReviewUI(holdingPath string) error {
 	holdingHeader := container.NewVBox(holdingPathLabel, holdingNameLabel)
 	matchHeader := container.NewVBox(matchPathLabel, matchNameLabel)
 
-	leftPanel := container.NewBorder(
-		holdingHeader, nil, nil, nil,
-		tappableHolding,
-	)
-	rightPanel := container.NewBorder(
-		matchHeader, nil, nil, nil,
-		tappableMatch,
-	)
+	leftPanel := container.NewBorder(holdingHeader, nil, nil, nil, tappableHolding)
+	rightPanel := container.NewBorder(matchHeader, nil, nil, nil, tappableMatch)
 
 	imageCompare := container.New(layout.NewGridWrapLayout(fyne.NewSize(550, 550)),
 		leftPanel, rightPanel,
 	)
 
-	// "Click to keep" hint + Keep Both centered below images.
 	hintLabel := widget.NewLabel("Click an image to keep it")
 	hintLabel.Alignment = fyne.TextAlignCenter
 	hintLabel.TextStyle = fyne.TextStyle{Italic: true}
@@ -329,9 +432,6 @@ func RunReviewUI(holdingPath string) error {
 
 	w.SetContent(content)
 	updateDisplay()
-	w.ShowAndRun()
-
-	return nil
 }
 
 func loadReviewList(path string) ([]checker.CheckResult, error) {
