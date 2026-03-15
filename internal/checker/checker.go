@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -220,16 +221,22 @@ func CheckHoldingFolder(holdingPath string, database *db.Database, cfg config.Co
 			}
 
 			// Check for near match (linear scan over pre-decoded bytes).
+			// Skip cross-format near matches (e.g., .jpg vs .nef) — different
+			// file types with similar hashes are not true duplicates.
 			if candidate, found := hashIdx.FindMatch(hr.DHash0, hr.DHash90, hr.DHash180, hr.DHash270, cfg.HammingThreshold); found {
-				result.MatchType = MatchNear
-				result.MatchPath = candidate.PathHint
-				result.Distance = candidate.Distance
-				atomic.AddInt64(&nearCount, 1)
+				holdingExt := strings.ToLower(filepath.Ext(filePath))
+				matchExt := strings.ToLower(filepath.Ext(candidate.PathHint))
+				if holdingExt == matchExt {
+					result.MatchType = MatchNear
+					result.MatchPath = candidate.PathHint
+					result.Distance = candidate.Distance
+					atomic.AddInt64(&nearCount, 1)
 
-				if !cfg.DryRun {
-					moveCh <- moveRequest{idx: idx, src: filePath, destDir: reviewDir, matchType: MatchNear}
+					if !cfg.DryRun {
+						moveCh <- moveRequest{idx: idx, src: filePath, destDir: reviewDir, matchType: MatchNear}
+					}
+					return
 				}
-				return
 			}
 
 			// No match.
