@@ -25,19 +25,23 @@ import (
 	"photo-dedup/internal/checker"
 )
 
-// ReviewEntry mirrors checker.ReviewEntry for JSON deserialization.
-type ReviewEntry = checker.ReviewEntry
-
 // RunReviewUI launches the Fyne desktop app for reviewing near-matches.
+// It reads review.json from the holding folder (produced by the check command).
+// Files are displayed side-by-side; the user can mark them as duplicates or not.
+// No files are moved during review — decisions are saved back to the JSON file.
 func RunReviewUI(holdingPath string) error {
-	reviewDir := filepath.Join(holdingPath, "review")
-	duplicatesDir := filepath.Join(holdingPath, "duplicates")
-
-	// Load manifest.
-	manifestPath := filepath.Join(reviewDir, "manifest.json")
-	entries, err := loadManifest(manifestPath)
+	resultsPath := filepath.Join(holdingPath, "results.json")
+	allEntries, err := loadReviewList(resultsPath)
 	if err != nil {
-		return fmt.Errorf("load manifest: %w", err)
+		return fmt.Errorf("load results: %w", err)
+	}
+
+	// Filter to near matches only — exact duplicates don't need visual review.
+	var entries []checker.CheckResult
+	for _, e := range allEntries {
+		if e.MatchType == checker.MatchNear {
+			entries = append(entries, e)
+		}
 	}
 
 	if len(entries) == 0 {
@@ -45,27 +49,24 @@ func RunReviewUI(holdingPath string) error {
 		return nil
 	}
 
-	// Ensure duplicates dir exists.
-	os.MkdirAll(duplicatesDir, 0755)
-
 	a := app.New()
 	w := a.NewWindow("Photo Dedup — Review Near Matches")
 	w.Resize(fyne.NewSize(1200, 700))
 
 	// State.
 	currentIdx := 0
-	remaining := make([]ReviewEntry, len(entries))
+	remaining := make([]checker.CheckResult, len(entries))
 	copy(remaining, entries)
 
 	// UI elements.
 	statusLabel := widget.NewLabel("")
 	distanceLabel := widget.NewLabel("")
-	reviewFileLabel := widget.NewLabel("")
+	holdingFileLabel := widget.NewLabel("")
 	matchFileLabel := widget.NewLabel("")
 
-	reviewImage := canvas.NewImageFromImage(nil)
-	reviewImage.FillMode = canvas.ImageFillContain
-	reviewImage.SetMinSize(fyne.NewSize(500, 500))
+	holdingImage := canvas.NewImageFromImage(nil)
+	holdingImage.FillMode = canvas.ImageFillContain
+	holdingImage.SetMinSize(fyne.NewSize(500, 500))
 
 	matchImage := canvas.NewImageFromImage(nil)
 	matchImage.FillMode = canvas.ImageFillContain
@@ -76,10 +77,10 @@ func RunReviewUI(holdingPath string) error {
 		if currentIdx >= len(remaining) {
 			statusLabel.SetText("All items reviewed!")
 			distanceLabel.SetText("")
-			reviewFileLabel.SetText("")
+			holdingFileLabel.SetText("")
 			matchFileLabel.SetText("")
-			reviewImage.Image = nil
-			reviewImage.Refresh()
+			holdingImage.Image = nil
+			holdingImage.Refresh()
 			matchImage.Image = nil
 			matchImage.Refresh()
 			return
@@ -88,16 +89,16 @@ func RunReviewUI(holdingPath string) error {
 		entry := remaining[currentIdx]
 		statusLabel.SetText(fmt.Sprintf("Item %d of %d", currentIdx+1, len(remaining)))
 		distanceLabel.SetText(fmt.Sprintf("Hamming distance: %d", entry.Distance))
-		reviewFileLabel.SetText(fmt.Sprintf("New: %s", entry.OriginalName))
+		holdingFileLabel.SetText(fmt.Sprintf("New: %s", filepath.Base(entry.HoldingFile)))
 
-		// Load review image.
-		if img, err := loadImage(entry.ReviewFile); err == nil {
-			reviewImage.Image = img
+		// Load holding image.
+		if img, err := loadImage(entry.HoldingFile); err == nil {
+			holdingImage.Image = img
 		} else {
-			reviewImage.Image = nil
-			log.Printf("Cannot load review image: %v", err)
+			holdingImage.Image = nil
+			log.Printf("Cannot load holding image: %v", err)
 		}
-		reviewImage.Refresh()
+		holdingImage.Refresh()
 
 		// Load match image.
 		if entry.MatchPath != "" {
@@ -115,44 +116,47 @@ func RunReviewUI(holdingPath string) error {
 		matchImage.Refresh()
 	}
 
-	// Action: Keep — move back to holding folder.
+	// Action: Keep — not a duplicate, remove from review list.
 	keepBtn := widget.NewButton("Keep (Not Duplicate)", func() {
 		if currentIdx >= len(remaining) {
 			return
 		}
 		entry := remaining[currentIdx]
-		dest := uniquePath(filepath.Join(holdingPath, entry.OriginalName))
-		if err := os.Rename(entry.ReviewFile, dest); err != nil {
-			dialog.ShowError(fmt.Errorf("move file: %w", err), w)
-			return
-		}
-		log.Printf("KEEP: %s → %s", entry.OriginalName, dest)
+		log.Printf("KEEP: %s", filepath.Base(entry.HoldingFile))
 		remaining = append(remaining[:currentIdx], remaining[currentIdx+1:]...)
 		if currentIdx >= len(remaining) && currentIdx > 0 {
 			currentIdx = len(remaining) - 1
 		}
 		updateDisplay()
-		saveManifest(manifestPath, remaining)
+		saveReviewList(resultsPath, remaining)
 	})
 
-	// Action: Delete — move to duplicates folder.
+	// Action: Delete — confirmed duplicate, delete the holding file.
 	deleteBtn := widget.NewButton("Delete (Is Duplicate)", func() {
 		if currentIdx >= len(remaining) {
 			return
 		}
 		entry := remaining[currentIdx]
-		dest := uniquePath(filepath.Join(duplicatesDir, entry.OriginalName))
-		if err := os.Rename(entry.ReviewFile, dest); err != nil {
-			dialog.ShowError(fmt.Errorf("move file: %w", err), w)
-			return
-		}
-		log.Printf("DELETE: %s → %s", entry.OriginalName, dest)
-		remaining = append(remaining[:currentIdx], remaining[currentIdx+1:]...)
-		if currentIdx >= len(remaining) && currentIdx > 0 {
-			currentIdx = len(remaining) - 1
-		}
-		updateDisplay()
-		saveManifest(manifestPath, remaining)
+
+		// Confirm before deleting.
+		dialog.ShowConfirm("Confirm Delete",
+			fmt.Sprintf("Permanently delete %s?", filepath.Base(entry.HoldingFile)),
+			func(confirmed bool) {
+				if !confirmed {
+					return
+				}
+				if err := os.Remove(entry.HoldingFile); err != nil {
+					dialog.ShowError(fmt.Errorf("delete file: %w", err), w)
+					return
+				}
+				log.Printf("DELETE: %s", entry.HoldingFile)
+				remaining = append(remaining[:currentIdx], remaining[currentIdx+1:]...)
+				if currentIdx >= len(remaining) && currentIdx > 0 {
+					currentIdx = len(remaining) - 1
+				}
+				updateDisplay()
+				saveReviewList(resultsPath, remaining)
+			}, w)
 	})
 
 	// Action: Skip — move to next without acting.
@@ -181,8 +185,8 @@ func RunReviewUI(holdingPath string) error {
 
 	// Layout.
 	leftPanel := container.NewBorder(
-		reviewFileLabel, nil, nil, nil,
-		reviewImage,
+		holdingFileLabel, nil, nil, nil,
+		holdingImage,
 	)
 	rightPanel := container.NewBorder(
 		matchFileLabel, nil, nil, nil,
@@ -216,7 +220,7 @@ func RunReviewUI(holdingPath string) error {
 	return nil
 }
 
-func loadManifest(path string) ([]ReviewEntry, error) {
+func loadReviewList(path string) ([]checker.CheckResult, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -225,21 +229,21 @@ func loadManifest(path string) ([]ReviewEntry, error) {
 		return nil, err
 	}
 
-	var entries []ReviewEntry
+	var entries []checker.CheckResult
 	if err := json.Unmarshal(data, &entries); err != nil {
 		return nil, err
 	}
 	return entries, nil
 }
 
-func saveManifest(path string, entries []ReviewEntry) {
+func saveReviewList(path string, entries []checker.CheckResult) {
 	data, err := json.MarshalIndent(entries, "", "  ")
 	if err != nil {
-		log.Printf("WARNING: failed to save manifest: %v", err)
+		log.Printf("WARNING: failed to save review list: %v", err)
 		return
 	}
 	if err := os.WriteFile(path, data, 0644); err != nil {
-		log.Printf("WARNING: failed to write manifest: %v", err)
+		log.Printf("WARNING: failed to write review list: %v", err)
 	}
 }
 
@@ -252,18 +256,4 @@ func loadImage(path string) (image.Image, error) {
 
 	img, _, err := image.Decode(f)
 	return img, err
-}
-
-func uniquePath(path string) string {
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		return path
-	}
-	ext := filepath.Ext(path)
-	base := path[:len(path)-len(ext)]
-	for i := 1; ; i++ {
-		candidate := fmt.Sprintf("%s_%d%s", base, i, ext)
-		if _, err := os.Stat(candidate); os.IsNotExist(err) {
-			return candidate
-		}
-	}
 }

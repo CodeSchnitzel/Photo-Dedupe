@@ -10,11 +10,11 @@ var reviewCmd = &cobra.Command{
 	Use:   "review <holding-path>",
 	Short: "Launch desktop UI to review near-match duplicates",
 	Long: `Opens a desktop window showing side-by-side comparisons of
-near-match files from the holding/review/ folder.
+near-match files listed in results.json (produced by the check command).
 
 For each pair, you can:
-  - Keep: move the file back to the holding folder (not a duplicate)
-  - Delete: move the file to the duplicates folder (confirmed duplicate)
+  - Keep: not a duplicate — remove from the review list
+  - Delete: confirmed duplicate — permanently delete the holding file
   - Skip: move to the next pair without acting`,
 	Args: cobra.ExactArgs(1),
 	RunE: runReview,

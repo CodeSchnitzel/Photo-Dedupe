@@ -32,33 +32,13 @@ type CheckResult struct {
 	MatchType    MatchType `json:"match_type"`
 	MatchPath    string    `json:"match_path,omitempty"`   // path_hint of the matched DB entry
 	Distance     int       `json:"distance,omitempty"`     // Hamming distance to best match
-	MovedTo      string    `json:"moved_to,omitempty"`     // where the file was moved
 	ErrorMessage string    `json:"error_message,omitempty"`
 }
 
-// ReviewEntry records info needed for the review UI (written to review/manifest.json).
-type ReviewEntry struct {
-	ReviewFile   string `json:"review_file"`   // path in review/ folder
-	OriginalName string `json:"original_name"` // original filename in holding
-	MatchPath    string `json:"match_path"`    // path_hint of the near-match
-	Distance     int    `json:"distance"`      // Hamming distance
-}
-
 // CheckHoldingFolder scans the holding folder and categorizes files as
-// exact duplicates, near matches, or unique.
+// exact duplicates, near matches, or unique. Files are never moved or
+// deleted — results are written to JSON lists in the holding folder.
 func CheckHoldingFolder(holdingPath string, database *db.Database, cfg config.Config, logger *logging.Logger) ([]CheckResult, error) {
-	duplicatesDir := filepath.Join(holdingPath, "duplicates")
-	reviewDir := filepath.Join(holdingPath, "review")
-
-	if !cfg.DryRun {
-		if err := os.MkdirAll(duplicatesDir, 0755); err != nil {
-			return nil, fmt.Errorf("create duplicates dir: %w", err)
-		}
-		if err := os.MkdirAll(reviewDir, 0755); err != nil {
-			return nil, fmt.Errorf("create review dir: %w", err)
-		}
-	}
-
 	// Find dcraw if needed.
 	dcrawPath := cfg.DcrawPath
 
@@ -72,11 +52,6 @@ func CheckHoldingFolder(holdingPath string, database *db.Database, cfg config.Co
 				return nil // skip inaccessible entries
 			}
 			if d.IsDir() {
-				// Skip the duplicates/ and review/ output directories.
-				name := d.Name()
-				if name == "duplicates" || name == "review" {
-					return filepath.SkipDir
-				}
 				return nil
 			}
 			if config.IsSupportedImage(path) {
@@ -137,47 +112,6 @@ func CheckHoldingFolder(holdingPath string, database *db.Database, cfg config.Co
 		errCount   int64
 	)
 
-	// File moves must be serialized to avoid destination collisions.
-	type moveRequest struct {
-		idx       int
-		src       string
-		destDir   string
-		matchType MatchType
-	}
-	moveCh := make(chan moveRequest, cfg.Workers*2)
-	var moveWg sync.WaitGroup
-
-	// Review entries collected by the move goroutine.
-	var reviewMu sync.Mutex
-	var reviewEntries []ReviewEntry
-
-	// Single goroutine handles all file moves sequentially.
-	moveWg.Add(1)
-	go func() {
-		defer moveWg.Done()
-		for req := range moveCh {
-			dest := uniquePath(filepath.Join(req.destDir, filepath.Base(req.src)))
-			if err := os.Rename(req.src, dest); err != nil {
-				results[req.idx].MatchType = MatchError
-				results[req.idx].ErrorMessage = fmt.Sprintf("move file: %v", err)
-				results[req.idx].MovedTo = ""
-				atomic.AddInt64(&errCount, 1)
-			} else {
-				results[req.idx].MovedTo = dest
-				if req.matchType == MatchNear {
-					reviewMu.Lock()
-					reviewEntries = append(reviewEntries, ReviewEntry{
-						ReviewFile:   dest,
-						OriginalName: filepath.Base(req.src),
-						MatchPath:    results[req.idx].MatchPath,
-						Distance:     results[req.idx].Distance,
-					})
-					reviewMu.Unlock()
-				}
-			}
-		}
-	}()
-
 	// Concurrent hash + match workers.
 	workers := cfg.Workers
 	if workers <= 0 {
@@ -213,10 +147,6 @@ func CheckHoldingFolder(holdingPath string, database *db.Database, cfg config.Co
 				result.Distance = 0
 				result.MatchPath = pathHint
 				atomic.AddInt64(&exactCount, 1)
-
-				if !cfg.DryRun {
-					moveCh <- moveRequest{idx: idx, src: filePath, destDir: duplicatesDir, matchType: MatchExact}
-				}
 				return
 			}
 
@@ -231,10 +161,6 @@ func CheckHoldingFolder(holdingPath string, database *db.Database, cfg config.Co
 					result.MatchPath = candidate.PathHint
 					result.Distance = candidate.Distance
 					atomic.AddInt64(&nearCount, 1)
-
-					if !cfg.DryRun {
-						moveCh <- moveRequest{idx: idx, src: filePath, destDir: reviewDir, matchType: MatchNear}
-					}
 					return
 				}
 			}
@@ -245,8 +171,6 @@ func CheckHoldingFolder(holdingPath string, database *db.Database, cfg config.Co
 	}
 
 	wg.Wait()
-	close(moveCh)
-	moveWg.Wait()
 
 	prog.Finish()
 	logger.ClearProgress()
@@ -268,11 +192,22 @@ func CheckHoldingFolder(holdingPath string, database *db.Database, cfg config.Co
 		}
 	}
 
-	// Write review manifest for the UI.
-	if len(reviewEntries) > 0 && !cfg.DryRun {
-		manifestPath := filepath.Join(reviewDir, "manifest.json")
-		if err := writeManifest(manifestPath, reviewEntries); err != nil {
-			logger.Warn("failed to write review manifest: %v", err)
+	// Write a single results.json with all matches (exact + near).
+	if !cfg.DryRun {
+		var matches []CheckResult
+		for _, r := range results {
+			if r.MatchType == MatchExact || r.MatchType == MatchNear {
+				matches = append(matches, r)
+			}
+		}
+
+		if len(matches) > 0 {
+			resultsPath := filepath.Join(holdingPath, "results.json")
+			if err := writeResultList(resultsPath, matches); err != nil {
+				logger.Warn("failed to write results file: %v", err)
+			} else {
+				logger.Info("Wrote %s (%d matches)", resultsPath, len(matches))
+			}
 		}
 	}
 
@@ -282,25 +217,9 @@ func CheckHoldingFolder(holdingPath string, database *db.Database, cfg config.Co
 	return results, nil
 }
 
-// uniquePath ensures the destination doesn't collide with an existing file
-// by appending _1, _2, etc.
-func uniquePath(path string) string {
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		return path
-	}
-	ext := filepath.Ext(path)
-	base := path[:len(path)-len(ext)]
-	for i := 1; ; i++ {
-		candidate := fmt.Sprintf("%s_%d%s", base, i, ext)
-		if _, err := os.Stat(candidate); os.IsNotExist(err) {
-			return candidate
-		}
-	}
-}
-
-// writeManifest writes the review entries to a JSON file for the review UI.
-func writeManifest(path string, entries []ReviewEntry) error {
-	data, err := json.MarshalIndent(entries, "", "  ")
+// writeResultList writes a slice of CheckResults to a JSON file.
+func writeResultList(path string, results []CheckResult) error {
+	data, err := json.MarshalIndent(results, "", "  ")
 	if err != nil {
 		return err
 	}

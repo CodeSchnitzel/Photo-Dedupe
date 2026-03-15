@@ -15,14 +15,13 @@ var checkCmd = &cobra.Command{
 	Use:   "check <holding-path>",
 	Short: "Check holding folder for duplicates against the index",
 	Long: `Scans the holding folder for image files and checks each one
-against the hash index.
+against the hash index. No files are moved or deleted.
 
-Results:
-  - Exact matches are moved to holding/duplicates/
-  - Near matches are moved to holding/review/ for visual inspection
-  - Unique files are left in place
+Results are written as JSON lists in the holding folder:
+  - duplicates.json — exact matches (safe to delete)
+  - review.json     — near matches (inspect before deciding)
 
-Use --dry-run to see what would happen without moving any files.`,
+Use --dry-run to skip writing the result files.`,
 	Args: cobra.ExactArgs(1),
 	RunE: runCheck,
 }
@@ -55,7 +54,7 @@ func runCheck(cmd *cobra.Command, args []string) error {
 	defer database.Close()
 
 	if cfg.DryRun {
-		logger.Info("DRY RUN — no files will be moved")
+		logger.Info("DRY RUN — no result files will be written")
 	}
 
 	logger.Info("Checking holding folder at %s (threshold=%d)", holdingPath, cfg.HammingThreshold)
@@ -82,8 +81,8 @@ func runCheck(cmd *cobra.Command, args []string) error {
 
 	logger.Info("")
 	logger.Info("Summary:")
-	logger.Info("  Exact duplicates:  %d (moved to duplicates/)", exact)
-	logger.Info("  Near matches:      %d (moved to review/)", near)
+	logger.Info("  Exact duplicates:  %d", exact)
+	logger.Info("  Near matches:      %d", near)
 	logger.Info("  Unique:            %d (left in place)", unique)
 	if errCount > 0 {
 		logger.Info("  Errors:            %d", errCount)
