@@ -41,6 +41,7 @@ type Config struct {
 	DcrawPath        string // path to dcraw binary, empty = auto-detect
 	LogFile          string // path to log file, empty = no file logging
 	Verbose          bool   // verbose stdout output
+	Recursive        bool   // recurse into subdirectories (check command)
 }
 
 // DefaultConfig returns a Config with sensible defaults.

@@ -27,13 +27,17 @@ Use --dry-run to see what would happen without moving any files.`,
 	RunE: runCheck,
 }
 
+var recursive bool
+
 func init() {
+	checkCmd.Flags().BoolVarP(&recursive, "recursive", "r", false, "recurse into subdirectories")
 	rootCmd.AddCommand(checkCmd)
 }
 
 func runCheck(cmd *cobra.Command, args []string) error {
 	holdingPath := args[0]
 	cfg := buildConfig()
+	cfg.Recursive = recursive
 
 	logger, err := logging.New(cfg.LogFile, cfg.Verbose)
 	if err != nil {
